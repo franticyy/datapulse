@@ -3,6 +3,8 @@ from pathlib import Path
 from datapulse.validator.checksum import calculate_hash, verify_checksum
 from datapulse.validator.archive import verify_archive_integrity
 from datapulse.reporter.certificate import generate_data_certificate
+from datapulse.downloader.mirror import resolve_optimal_mirror
+
 
 
 def test_checksum_verification(tmp_path: Path):
@@ -59,3 +61,12 @@ def test_certificate_generation(tmp_path: Path):
     assert Path(certs["json"]).exists()
     assert Path(certs["html"]).exists()
     assert "sample_1.fastq.gz" in Path(certs["html"]).read_text(encoding="utf-8")
+
+
+def test_mirror_resolution_fallback():
+    """Verify that regular URLs return Direct Origin and unavailable mirrors fallback safely."""
+    test_url = "https://raw.githubusercontent.com/torvalds/linux/master/README"
+    resolved_url, provider = resolve_optimal_mirror(test_url)
+
+    assert resolved_url == test_url
+    assert provider == "Direct Origin"

@@ -16,7 +16,7 @@ from datapulse.validator.schema import validate_records
 
 app = typer.Typer(
     name="datapulse",
-    help="High-Performance Resilient Data Extraction & Validation CLI",
+    help="Enterprise-Grade Resilient Data Ingestion, Extraction & Cryptographic Provenance Engine",
     add_completion=False,
 )
 console = Console()
@@ -24,40 +24,40 @@ console = Console()
 
 @app.command()
 def download(
-    url: str = typer.Argument(..., help="İndirilecek dosyanın URL adresi"),
-    output_dir: str = typer.Option("downloads", "--output", "-o", help="Hedef klasör"),
-    filename: Optional[str] = typer.Option(None, "--name", "-n", help="Kaydedilecek dosya adı"),
+    url: str = typer.Argument(..., help="Target file download URL"),
+    output_dir: str = typer.Option("downloads", "--output", "-o", help="Target destination directory"),
+    filename: Optional[str] = typer.Option(None, "--name", "-n", help="Optional output filename override"),
 ):
-    """Büyük dosyaları parça parça ve kesintiye dayanıklı şekilde tekil indirir."""
-    console.print(Panel(f"[bold cyan]İndirme Başlatılıyor:[/bold cyan] {url}", border_style="blue"))
+    """Resilient single-file stream download with HTTP Range auto-resume support."""
+    console.print(Panel(f"[bold cyan]Initiating Stream Download:[/bold cyan] {url}", border_style="blue"))
     try:
         saved_path = download_stream(url=url, output_dir=output_dir, filename=filename)
-        console.print(f"[bold green]✔ Başarıyla tamamlandı:[/bold green] {saved_path}")
-    except Exception as e:
-        console.print(f"[bold red]✖ İndirme hatası:[/bold red] {e}")
+        console.print(f"[bold green]✔ Download completed successfully:[/bold green] {saved_path}")
+    except Exception as err:
+        console.print(f"[bold red]✖ Download error:[/bold red] {err}")
         raise typer.Exit(code=1)
 
 
 @app.command()
 def verify(
-    file_path: str = typer.Argument(..., help="Doğrulanacak dosya yolu"),
-    expected_hash: str = typer.Argument(..., help="Beklenen hash değeri"),
-    algo: str = typer.Option("sha256", "--algo", "-a", help="Algoritma: sha256 veya md5"),
+    file_path: str = typer.Argument(..., help="Path to the target artifact to verify"),
+    expected_hash: str = typer.Argument(..., help="Expected cryptographic hash digest"),
+    algo: str = typer.Option("sha256", "--algo", "-a", help="Hashing algorithm: sha256 or md5"),
 ):
-    """Dosyanın MD5 veya SHA-256 bütünlüğünü kontrol eder."""
+    """Cryptographic integrity verification engine (MD5 / SHA-256)."""
     path = Path(file_path)
     if not path.exists():
-        console.print(f"[bold red]Hata:[/bold red] Dosya bulunamadı: {file_path}")
+        console.print(f"[bold red]Error:[/bold red] Target artifact not found: {file_path}")
         raise typer.Exit(code=1)
 
     is_valid = verify_checksum(path, expected_hash, algorithm=algo)
     if is_valid:
-        console.print(f"[bold green]✔ Hash Doğrulandı ({algo.upper()} Eşleşti!)[/bold green]")
+        console.print(f"[bold green]✔ Hash Verified ({algo.upper()} digest matches expected value!)[/bold green]")
     else:
         current_hash = calculate_hash(path, algorithm=algo)
-        console.print(f"[bold red]✖ Bütünlük Hatası! Dosya bozulmuş veya uyuşmuyor.[/bold red]")
-        console.print(f"Mevcut Hash:   {current_hash}")
-        console.print(f"Beklenen Hash: {expected_hash}")
+        console.print("[bold red]✖ Integrity Mismatch! Artifact corrupted or checksum divergent.[/bold red]")
+        console.print(f"Calculated Digest: {current_hash}")
+        console.print(f"Expected Digest:   {expected_hash}")
         raise typer.Exit(code=1)
 
 
@@ -67,16 +67,16 @@ def pipeline(
         "https://raw.githubusercontent.com/torvalds/linux/master/README",
         "--url",
         "-u",
-        help="Kaynak URL",
+        help="Source URL for the dataset",
     ),
     webhook_url: Optional[str] = typer.Option(
-        None, "--webhook", "-w", help="Discord/Slack Webhook URL"
+        None, "--webhook", "-w", help="Discord/Slack Webhook URL for run alerts"
     ),
 ):
-    """Uçtan uca pipeline: İndir -> Hash Doğrula -> Şema Denetle -> Excel Raporu Çıkar."""
+    """End-to-end reference pipeline: Stream -> Hash Check -> Schema Validation -> Audit Export."""
     console.print(
         Panel.fit(
-            "[bold white]DataPulse Uçtan Uca ETL Pipeline Çalışıyor[/bold white]",
+            "[bold white]DataPulse Resilient ETL Pipeline Executing[/bold white]",
             border_style="magenta",
         )
     )
@@ -86,9 +86,9 @@ def pipeline(
     file_hash = calculate_hash(downloaded_file, algorithm="sha256")
 
     mock_batch = [
-        {"id": 101, "title": "Sunucu Güç Kaynağı", "category": "Altyapı", "price": 4200.0},
-        {"id": 102, "title": "Cat6 Kablo 100m", "category": "Ağ", "price": 850.0},
-        {"id": 103, "title": "A", "category": "Geçersiz Kayıt", "price": -10.0},
+        {"id": 101, "title": "Server Power Supply Unit", "category": "Infrastructure", "price": 4200.0},
+        {"id": 102, "title": "Cat6 Shielded Cable 100m", "category": "Networking", "price": 850.0},
+        {"id": 103, "title": "A", "category": "Invalid Row", "price": -10.0},
     ]
     valid_records, invalid_records = validate_records(mock_batch)
     report_path = export_to_excel(valid_records, output_dir="reports", filename="pipeline_run.xlsx")
@@ -100,93 +100,92 @@ def pipeline(
         checksum_passed=True,
     )
 
-    table = Table(title="Pipeline Yürütme Özeti", border_style="cyan")
-    table.add_column("Metrik", style="bold white")
-    table.add_column("Değer", style="green")
+    table = Table(title="Pipeline Execution Telemetry", border_style="cyan")
+    table.add_column("Metric", style="bold white")
+    table.add_column("Value", style="green")
 
-    table.add_row("Durum", summary["status"])
-    table.add_row("İndirilen Dosya", str(downloaded_file))
-    table.add_row("Dosya Boyutu", f"{summary['downloaded_bytes']} bytes")
-    table.add_row("SHA-256 Hash", f"{file_hash[:16]}... (tamamı doğrulandı)")
-    table.add_row("Geçerli Kayıtlar", str(summary["valid_records"]))
-    table.add_row("Ayıklanan Hatalı Veri", str(summary["invalid_records"]))
-    table.add_row("Excel Çıktısı", str(report_path))
+    table.add_row("Execution Status", summary["status"])
+    table.add_row("Ingested Artifact", str(downloaded_file))
+    table.add_row("Artifact Size", f"{summary['downloaded_bytes']:,} bytes")
+    table.add_row("SHA-256 Digest", f"{file_hash[:16]}... (cryptographically verified)")
+    table.add_row("Valid Records", str(summary["valid_records"]))
+    table.add_row("Evicted Invalids", str(summary["invalid_records"]))
+    table.add_row("Excel Report", str(report_path))
 
     console.print(table)
 
     if webhook_url:
         send_webhook_notification(webhook_url, summary)
-        console.print("[dim]Webhook bildirimi iletildi.[/dim]")
+        console.print("[dim]Webhook notification dispatched successfully.[/dim]")
 
 
 @app.command()
 def auto():
-    """Kullanıcı dostu interaktif sihirbaz: Link, başlık ve paralel indirme sayısı sorup otomatik çalışır."""
+    """Interactive wizard: Resolves links via DOM or REST API, prompts concurrency, runs parallel pool."""
     console.print(
         Panel.fit(
-            "[bold cyan]DataPulse Akıllı Veri Toplayıcı & Çok Kanallı İndirici[/bold cyan]\n"
-            "Herhangi bir parametre yazmanıza gerek yok, yönergeleri takip etmeniz yeterli.",
+            "[bold cyan]DataPulse Auto-Pilot Wizard & Multi-Worker Ingestion Pool[/bold cyan]\n"
+            "Zero configuration required. Follow the guided interactive prompts.",
             border_style="cyan",
         )
     )
 
-    # 1. Kullanıcıdan URL ve Başlık al
-    target_url = typer.prompt("Web sitesi linkini girin")
+    # 1. Prompt target URL and search keyword
+    target_url = typer.prompt("Enter source URL (study accession, web directory, or archive link)")
     keyword = typer.prompt(
-        "İndirmek istediğiniz dataların başlığı / anahtar kelimesi (hepsi için Enter)",
+        "Keyword or title filter (press Enter to ingest all discovered artifacts)",
         default="",
     )
 
-    console.print(f"\n[yellow]🔍 Sayfa taranıyor...[/yellow]")
+    console.print("\n[yellow]🔍 Resolving artifacts & scraping target metadata...[/yellow]")
     try:
         matched_files = discover_download_links(target_url, title_keyword=keyword)
-    except Exception as e:
-        console.print(f"[bold red]Sayfaya erişilirken hata oluştu:[/bold red] {e}")
+    except Exception as err:
+        console.print(f"[bold red]Failed to resolve target metadata:[/bold red] {err}")
         raise typer.Exit(code=1)
 
     if not matched_files:
-        console.print("[bold red]Eşleşen herhangi bir veri dosyası bulunamadı.[/bold red]")
+        console.print("[bold red]No matching artifacts discovered at target origin.[/bold red]")
         return
 
-    # 2. Bulunan dosyaları listele
+    # 2. Display discovered artifacts table
     result_table = Table(
-        title=f"Bulunan Dosyalar ({len(matched_files)} Adet)", border_style="green"
+        title=f"Discovered Artifacts ({len(matched_files)} items)", border_style="green"
     )
-    result_table.add_column("No", justify="right", style="cyan")
-    result_table.add_column("Başlık", style="white")
-    result_table.add_column("Uzantı", style="magenta")
-    result_table.add_column("MD5 Durumu", style="yellow")
+    result_table.add_column("#", justify="right", style="cyan")
+    result_table.add_column("Artifact Title / Target", style="white")
+    result_table.add_column("Format", style="magenta")
+    result_table.add_column("Upstream Digest Status", style="yellow")
 
     for i, item in enumerate(matched_files, 1):
-        md5_status = "Mevcut (API)" if item.get("expected_md5") else "İndirme sonrası üretilecek"
+        md5_status = "Available (Remote API)" if item.get("expected_md5") else "Generated Post-Ingestion"
         result_table.add_row(
             str(i), item["title"][:45], item["extension"], md5_status
         )
 
     console.print(result_table)
 
-    # 3. İndirme Onayı ve Eşzamanlılık (Concurrency) Ayarı
+    # 3. Confirmation & concurrency prompt
     should_download = typer.confirm(
-        f"\nBu {len(matched_files)} dosya indirilsin mi?",
+        f"\nProceed with ingesting these {len(matched_files)} artifacts?",
         default=True,
     )
     if not should_download:
-        console.print("[yellow]İşlem iptal edildi.[/yellow]")
+        console.print("[yellow]Ingestion batch aborted by operator.[/yellow]")
         return
 
-    # Kullanıcıya eşzamanlı worker sayısı soruluyor
     concurrency = typer.prompt(
-        "Aynı anda kaç dosya paralel indirilsin? (Önerilen: 2 - 5)",
-        default=3,
+        "Parallel worker concurrency (Recommended: 2 - 6)",
+        default=4,
         type=int,
     )
-    concurrency = max(1, min(concurrency, 10))  # 1 ile 10 arasında sınırla
+    concurrency = max(1, min(concurrency, 16))
 
     console.print(
-        f"\n[bold green]🚀 {concurrency} adet paralel worker ile çoklu indirme ve doğrulama başlatılıyor...[/bold green]\n"
+        f"\n[bold green]🚀 Spawning {concurrency} parallel worker threads with stream validation...[/bold green]\n"
     )
 
-    # 4. Çok Kanallı Paralel İndirme ve Hash Denetimi
+    # 4. Multi-threaded ingestion pool
     results = download_concurrently(
         items=matched_files,
         output_dir="downloads",
@@ -194,24 +193,24 @@ def auto():
         calculate_hash_func=calculate_hash,
     )
 
-    # 5. Başarılı olanları filtrele ve Rapor / Sertifika üret
+    # 5. Provenance certificate & manifest generation
     successful_records = [r for r in results if r["success"]]
 
     if successful_records:
         certs = generate_data_certificate(successful_records, output_dir="reports")
         console.print(
             Panel.fit(
-                f"[bold green]✔ İşlem Başarıyla Tamamlandı![/bold green]\n\n"
-                f"[cyan]📁 İndirilen Dosyalar:[/cyan] downloads/\n"
-                f"[green]⚡ Başarılı Dosya Sayısı:[/green] {len(successful_records)} / {len(matched_files)}\n"
-                f"[magenta]📜 JSON Manifest:[/magenta] {certs['json']}\n"
-                f"[gold1]🏆 HTML Veri Sertifikası:[/gold1] {certs['html']}",
+                f"[bold green]✔ Ingestion Batch Completed Successfully![/bold green]\n\n"
+                f"[cyan]📁 Artifact Destination:[/cyan] downloads/\n"
+                f"[green]⚡ Verified Deliveries:[/green] {len(successful_records)} / {len(matched_files)}\n"
+                f"[magenta]📜 JSON Provenance Manifest:[/magenta] {certs['json']}\n"
+                f"[gold1]🏆 Dark HTML Data Certificate:[/gold1] {certs['html']}",
                 border_style="green",
-                title="Provenans Raporu Üretildi",
+                title="Cryptographic Provenance Generated",
             )
         )
     else:
-        console.print("[bold red]Hiçbir dosya başarıyla indirilemedi veya doğrulanamadı.[/bold red]")
+        console.print("[bold red]No artifacts were successfully transferred or verified.[/bold red]")
 
 
 if __name__ == "__main__":

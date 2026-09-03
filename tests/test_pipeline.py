@@ -6,11 +6,10 @@ from datapulse.reporter.certificate import generate_data_certificate
 
 
 def test_checksum_verification(tmp_path: Path):
-    """MD5 ve SHA-256 hash hesaplama ve doğrulama testi."""
+    """Verify MD5 and SHA-256 calculation and validation logic."""
     test_file = tmp_path / "sample.txt"
     test_file.write_text("DataPulse Resilient Engine Test Data", encoding="utf-8")
 
-    # Bilinen hash doğrulaması
     sha256 = calculate_hash(test_file, algorithm="sha256")
     md5 = calculate_hash(test_file, algorithm="md5")
 
@@ -22,26 +21,26 @@ def test_checksum_verification(tmp_path: Path):
 
 
 def test_archive_integrity_valid_and_corrupt(tmp_path: Path):
-    """Gzip arşiv doğrulama motorunun sağlam ve bozuk dosyaları yakalama testi."""
+    """Verify zero-RAM archive integrity detector on both clean and corrupted streams."""
     valid_gz = tmp_path / "valid.fastq.gz"
     with gzip.open(valid_gz, "wb") as f:
         f.write(b"@SEQ1\nACGTACGT\n+\nIIIIIIII\n")
 
     is_valid, msg = verify_archive_integrity(valid_gz)
     assert is_valid is True
-    assert "bütünlüğü doğrulandı" in msg
+    assert "verified" in msg.lower()
 
-    # Bilerek bozulmuş (truncated / bozuk baytlı) gzip oluştur
+    # Create deliberately corrupted gzip stream (invalid bytes / truncated)
     corrupt_gz = tmp_path / "corrupt.fastq.gz"
-    corrupt_gz.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xcd\xef")  # Eksik/bozuk arşiv
+    corrupt_gz.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xcd\xef")
 
     is_corrupt_valid, corrupt_msg = verify_archive_integrity(corrupt_gz)
     assert is_corrupt_valid is False
-    assert "Bozuk arşiv" in corrupt_msg or "Eksik dosya" in corrupt_msg
+    assert "corrupted" in corrupt_msg.lower() or "truncated" in corrupt_msg.lower()
 
 
 def test_certificate_generation(tmp_path: Path):
-    """JSON manifest ve HTML sertifika üretim testi."""
+    """Verify JSON audit manifest and dark HTML certificate generation."""
     mock_records = [
         {
             "filename": "sample_1.fastq.gz",
@@ -50,7 +49,7 @@ def test_certificate_generation(tmp_path: Path):
             "calculated_md5": "d41d8cd98f00b204e9800998ecf8427e",
             "calculated_sha256": "",
             "verified": True,
-            "archive_status": "Gzip akış CRC32 doğrulandı.",
+            "archive_status": "Gzip stream integrity verified.",
         }
     ]
 

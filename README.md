@@ -1,117 +1,132 @@
 <div align="center">
 
-# ⚡ DataPulse
+# DataPulse
 
-**Enterprise-Grade Resilient Data Ingestion, Extraction & Cryptographic Provenance Engine**
+**Resilient, Provable Ingestion & Provenance Engine for Genomic Archives**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/franticyy/datapulse)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-
-*A high-throughput, fault-tolerant ingestion pipeline designed for mission-critical datasets (e.g., NGS metagenomic FASTQ archives, open data repositories, release binaries) featuring zero-RAM archive inspection, dynamic worker pools, and automated cryptographic provenance audit trails.*
 
 </div>
 
 ---
 
-## 🎯 The Problem & Engineering Motivation
+## Overview
 
-Modern automated data pipelines and data engineering workflows face recurring real-world failure modes:
-1. **Network Instability & Flaky Servers:** Large transfers (1-20+ GB) frequently drop mid-stream, requiring redundant full-file redownloads without native HTTP range resume.
-2. **Silent Bitrot & Truncated Archives:** Files can report a complete download (HTTP 200) despite containing network-induced bit flips, bad block headers, or missing EOF bytes (.fastq.gz, .tar.gz, .zip), which inevitably crashes downstream analytics pipelines hours later.
-3. **Severe Upstream Bandwidth Throttling:** Specialized academic and government repositories (e.g., EBI/ENA Hinxton nodes) throttle single TCP streams down to ~400-800 KB/s.
-4. **Lack of Data Provenance:** Production systems require verifiable proof regarding what was downloaded, when, from which origin, and under what cryptographic hash.
+DataPulse is a lightweight, zero-configuration CLI tool and pipeline engine engineered to solve the chronic failure modes of high-throughput genomic data ingestion (ENA, SRA, NCBI). 
 
-DataPulse solves these challenges out-of-the-box through an interactive, zero-configuration CLI workflow.
-
----
-
-## 🏗 Key Features & Architecture
-
-### 1. Zero-Friction Interactive Wizard (`datapulse auto`)
-- Prompts only for the target URL and an optional search keyword.
-- Automatically handles static HTML parsing (via BeautifulSoup) or switches dynamically to specialized REST APIs (e.g., ENA Portal API for genomic accessions PRJ*, ERR*, SRR*).
-- Queries the user for desired concurrency (max_workers) to optimize network utilization.
-
-### 2. Multi-Threaded Chunking & Resilient Streaming
-- Built on httpx with HTTP/2 pooling and a 1 MB buffered zero-thrash I/O engine.
-- Implements Range: bytes={offset}- headers to guarantee graceful auto-resume upon network interruption.
-- Multi-bar visual monitoring powered by rich.progress.
-
-### 3. Dual-Layer Cryptographic & Archive Integrity
-- **Layer 1 (Checksum Matching):** Performs real-time MD5/SHA-256 calculation. If an authoritative checksum exists upstream, mismatches trigger autonomous file eviction and retry policies (Self-Healing).
-- **Layer 2 (Zero-RAM Archive Verification):** Pipes gzip/FASTQ compressed streams directly to verify CRC32 and trailing ISIZE invariants, tests ZIP directory tables via zipfile.testzip(), and validates TAR block headers without unpacking files to disk.
-
-### 4. Data Provenance & Cryptographic Audit Trails
-- Compiles every pipeline execution into an immutable `reports/audit_manifest.json`.
-- Automatically renders a modern, dark-themed HTML Data Certificate (`reports/certificate.html`) containing throughput metrics, file hashes, and compliance stamps.
+Rather than relying on unverified transfers or hammering public servers, DataPulse introduces:
+- Ethical Mirror Routing: Transparent fallback to AWS Open Data public cloud buckets to bypass upstream bottlenecks and protect public infrastructure.
+- Resilient Streaming: Chunked transfers powered by HTTP Range auto-resume.
+- On-the-Fly Verification: Streamed CRC32 and archive boundary validation without high-memory decompression bottlenecks.
+- Cryptographic Provenance: Automated creation of immutable audit manifests (JSON) and HTML Data Integrity Certificates.
 
 ---
 
-## 🚀 Throughput Benchmarking
+## Architecture Flow
 
-Observed real-world performance against bandwidth-throttled upstream servers (e.g., European Bioinformatics Institute):
-
-| Ingestion Mode | Active Workers | Average Transfer Speed | Total Throughput | Fault Recovery |
-| :--- | :---: | :---: | :---: | :---: |
-| Standard Single Stream | 1 | ~380 kB/s | ~380 kB/s | None (Restart on drop) |
-| DataPulse Parallel Pool | 4 | ~350 kB/s / worker | ~1.40 MB/s | Automatic Range Resume |
-| DataPulse High-Concurrency | 8 | ~310 kB/s / worker | ~2.48 MB/s | Self-Healing + CRC32 |
-
-*(When ingesting from CDNs or AWS S3 buckets, single-worker and multi-worker throughput readily saturates available local gigabit lines at 25-60+ MB/s).*
+User Input (Accession / ENA URL / Direct Link)
+                      │
+                      ▼
+       [ Smart Mirror Resolver ]
+      /                         \
+[AWS Open Data S3]       [Primary ENA Node]
+(Zero Server Load)       (Graceful Fallback)
+      \                         /
+       ▼                       ▼
+    [ Resilient HTTP Range Stream ]
+                      │
+                      ▼
+     [ Real-Time Stream Decompressor ]
+        ├── CRC32 Checksum Validation
+        └── EOF / Truncation Sentinel
+                      │
+                      ▼
+     [ Immutable Provenance Reporter ]
+        ├── Machine-Readable JSON Manifest
+        └── Human-Auditable HTML Certificate
 
 ---
 
-## 💻 Installation & Quickstart
+## Key Features
 
-```bash
-# 1. Clone repository
-git clone https://github.com/gulberkay/datapulse.git
+- Ethical Cloud Routing (AWS Open Data): Parses ENA browser links or accession tags (ERR..., SRR...) and redirects payload streaming to AWS Open Data S3 mirrors (sra-pub-run-odp), eliminating public server stress and upstream rate-limiting.
+- Fault-Tolerant Streaming: Seamlessly recovers interrupted connections byte-for-byte using standard HTTP Range headers.
+- Streaming Archive Verification: Checks multi-gigabyte .fastq.gz archives on the fly for silent truncation (missing gzip EOF markers or bit rot) without saturating local RAM.
+- Audit-Ready Certificates: Issues cryptographic audit records documenting SHA-256 digests, payload sizes, upstream resolution details, and integrity timestamps.
+- Dual Mode (CLI & Auto-Pilot): Run targeted single downloads, parallel study batches, or launch interactive ingestion sessions.
+
+---
+
+## Installation
+
+### From Source (Local Development)
+
+git clone [https://github.com/franticyy/datapulse.git](https://github.com/franticyy/datapulse.git)
 cd datapulse
-
-# 2. Setup virtual environment
 python -m venv .venv
-.venv\Scripts\activate
 
-# 3. Install in editable mode with dependencies
+# On Linux / macOS:
+source .venv/bin/activate
+
+# On Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+
 pip install -e .
-pip install "httpx[http2]"
-```
 
 ---
 
-## 🛠 Usage Examples
+## Usage
 
-### 1. Interactive Auto-Pilot Wizard (Recommended)
-```bash
+### 1. Smart Download (Cloud Mirror Auto-Routing)
+
+Pass a direct FASTQ URL, an ENA browser link, or a raw run accession ID. DataPulse automatically identifies the source and routes traffic to the optimal cloud mirror:
+
+datapulse download "[https://www.ebi.ac.uk/ena/browser/view/ERR15003723](https://www.ebi.ac.uk/ena/browser/view/ERR15003723)"
+datapulse download "ERR15003723"
+datapulse download "[https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/ERR123456_1.fastq.gz](https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/ERR123456_1.fastq.gz)"
+
+### 2. Full Ingestion Pipeline
+
+Executes the complete lifecycle: Stream -> Hash Check -> Archive Validation -> Audit Manifest & Certificate:
+
+datapulse pipeline "[https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/ERR123456_1.fastq.gz](https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/ERR123456_1.fastq.gz)" --output-dir ./data
+
+### 3. Interactive Auto-Pilot Wizard
+
+Launches an interactive prompt to resolve studies, configure thread concurrency, and execute multi-sample downloads:
+
 datapulse auto
-```
 
-### 2. Standard Single-File Resilient Download
-```bash
-datapulse download "https://example.com/dataset.tar.gz" --output downloads
-```
+### 4. Standalone Integrity Check
 
-### 3. Cryptographic Verification
-```bash
-datapulse verify downloads/sample.fastq.gz <expected_hash> --algo md5
-```
+Validate existing local files against silent corruption or truncated transfers:
 
-### 4. End-to-End Enterprise ETL Pipeline
-```bash
-datapulse pipeline --url "https://raw.githubusercontent.com/torvalds/linux/master/README"
-```
+datapulse verify-archive ./data/sample_1.fastq.gz
 
 ---
 
-## 📂 Generated Artifacts & Provenance
+## Verification & Reports
 
-When an ingestion batch concludes, DataPulse writes immutable provenance records to reports/:
-- `reports/audit_manifest.json` (Machine-readable provenance contract)
-- `reports/certificate.html` (Verifiable, styled audit certificate)
+Every completed pipeline run generates two artifacts in the reports/ directory:
+
+1. audit_manifest.json: Machine-readable metadata record containing payload checksums, source provenance, and pipeline execution specs.
+2. certificate.html: A self-contained, responsive report dashboard suitable for compliance auditing and publication supplementary documentation.
 
 ---
 
-## 🛡 License
+## Development & Testing
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+DataPulse maintains strict test coverage using pytest.
+
+Run the test suite locally:
+
+pytest -v
+
+---
+
+## License
+
+Distributed under the MIT License. See LICENSE for more information.

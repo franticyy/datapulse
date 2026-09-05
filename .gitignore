@@ -8,3 +8,7 @@ reports/
 dist/
 build/
 .env
+*.part
+*.bam
+*.bai
+*.fastq.gz

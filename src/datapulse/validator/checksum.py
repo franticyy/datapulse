@@ -1,36 +1,30 @@
 import hashlib
-from pathlib import Path
+import time
 
 
-def calculate_hash(
-    file_path: Path | str, algorithm: str = "sha256", chunk_size: int = 1024 * 64
-) -> str:
-    """Büyük dosyaları bellek dostu şekilde parça parça okuyarak hash hesaplar."""
-    algo = algorithm.lower()
-    if algo == "md5":
-        hasher = hashlib.md5()
-    elif algo == "sha256":
-        hasher = hashlib.sha256()
-    else:
-        raise ValueError(f"Desteklenmeyen algoritma: {algorithm}. 'md5' veya 'sha256' kullanın.")
+def calculate_hash(path: str, algorithm: str = "sha256") -> str:
+    """Calculates cryptographic hash digest with a retry tolerance for file descriptor release."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            hasher = getattr(hashlib, algorithm)()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except PermissionError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(0.2)
 
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Dosya bulunamadı: {file_path}")
-
+    hasher = getattr(hashlib, algorithm)()
     with open(path, "rb") as f:
-        while chunk := f.read(chunk_size):
+        for chunk in iter(lambda: f.read(65536), b""):
             hasher.update(chunk)
-
     return hasher.hexdigest()
 
 
-def verify_checksum(
-    file_path: Path | str, expected_hash: str, algorithm: str = "sha256"
-) -> bool:
-    """Hesaplanan hash ile beklenen hash değerini güvenli şekilde karşılaştırır."""
-    calculated = calculate_hash(file_path, algorithm=algorithm)
-    # Timing attack riskini önlemek için hmac.compare_digest benzeri güvenli karşılaştırma
-    import hmac
-
-    return hmac.compare_digest(calculated.lower(), expected_hash.strip().lower())
+def verify_checksum(file_path: str, expected_hash: str, algorithm: str = "sha256") -> bool:
+    """Compares calculated hash against an expected reference hash."""
+    actual_hash = calculate_hash(file_path, algorithm=algorithm)
+    return actual_hash.strip().lower() == expected_hash.strip().lower()

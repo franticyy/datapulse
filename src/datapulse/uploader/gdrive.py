@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -11,15 +11,45 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# .env dosyasını otomatik yükle (varsa)
+# .env dosyasını otomatik yükle
 load_dotenv()
 
-# Ortam değişkenlerinden oku
-CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET", "")
+# Sabit Client ID (herkese açık, secret değil)
+_DEFAULT_CLIENT_ID = "396328443248-uuelqf17k1brq7pgaqe6roq64t37hsig.apps.googleusercontent.com"
 
-# Sadece DataPulse uygulamasının yüklediği dosyaları yönetme kapsamı
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+_ENV_PATH = Path(".env")
+
+
+def _setup_wizard() -> tuple:
+    """
+    İlk çalıştırmada kullanıcıdan Client Secret ister ve .env'e kaydeder.
+    Bir sonraki çalıştırmada otomatik okunur, bir daha sorulmaz.
+    """
+    print("\n🔑 Google Drive — İlk Kurulum")
+    print("─" * 40)
+    print("Client ID otomatik ayarlandı.")
+    print("Client Secret için proje yöneticisinden alın.\n")
+
+    secret = input("Client Secret: ").strip()
+    if not secret:
+        raise ValueError("Client Secret boş bırakılamaz.")
+
+    _ENV_PATH.touch(exist_ok=True)
+    set_key(str(_ENV_PATH), "GDRIVE_CLIENT_ID", _DEFAULT_CLIENT_ID)
+    set_key(str(_ENV_PATH), "GDRIVE_CLIENT_SECRET", secret)
+    load_dotenv(override=True)
+
+    print("✓ Ayarlar kaydedildi. Bir daha sorulmayacak.\n")
+    return _DEFAULT_CLIENT_ID, secret
+
+
+def _get_credentials() -> tuple:
+    client_id = os.getenv("GDRIVE_CLIENT_ID", "")
+    client_secret = os.getenv("GDRIVE_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        client_id, client_secret = _setup_wizard()
+    return client_id, client_secret
 
 
 def extract_folder_id(folder_input: str) -> str:
@@ -50,16 +80,11 @@ def get_gdrive_service():
                 creds = None
 
         if not creds or not creds.valid:
-            if not CLIENT_ID or not CLIENT_SECRET:
-                raise RuntimeError(
-                    "Google Drive credentials eksik. "
-                    "GDRIVE_CLIENT_ID ve GDRIVE_CLIENT_SECRET ortam değişkenlerini "
-                    "veya .env dosyasını tanımla."
-                )
+            client_id, client_secret = _get_credentials()
             client_config = {
                 "installed": {
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
                     "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",

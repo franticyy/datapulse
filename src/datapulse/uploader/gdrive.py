@@ -10,14 +10,8 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 # Öncelik ortam değişkenlerinde; tanımlı değilse varsayılan uygulama kimlikleri kullanılır
-CLIENT_ID = os.getenv(
-    "GDRIVE_CLIENT_ID",
-    "396328443248-uuelqf17k1brq7pgaqe6roq64t37hsig.apps.googleusercontent.com"
-)
-CLIENT_SECRET = os.getenv(
-    "GDRIVE_CLIENT_SECRET",
-    "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"
-)
+CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET", "")
 
 # Sadece DataPulse uygulamasının yüklediği dosyaları yönetme kapsamı
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]

@@ -1,55 +1,101 @@
-import re
-from typing import Optional, Tuple
-import httpx
+import requests
 
 
-def extract_run_accession(text: str) -> Optional[str]:
-    """Extracts SRA/ENA/DRA run accession identifiers (e.g., ERR1234567, SRR987654)
+def generate_mirror_urls(fastq_ftp_path: str):
+    # Başındaki ftp:// veya ftp.sra.ebi.ac.uk/ kısmını temizle
+    clean_path = fastq_ftp_path.replace("ftp://", "").replace("ftp.sra.ebi.ac.uk/", "").lstrip("/")
+    if not clean_path.startswith("vol1/"):
+        clean_path = f"vol1/{clean_path}"
 
-    from raw strings, URLs, or browser view paths.
+    return [
+        # 1. AWS S3 Open Data Mirror
+        f"https://era-public.s3.amazonaws.com/{clean_path}",
+        # 2. EBI HTTPS Mirror (Çok hızlıdır ve ENA'nın doğrudan web aynasıdır)
+        f"https://ftp.sra.ebi.ac.uk/{clean_path}",
+        # 3. Standart FTP
+        f"ftp://ftp.sra.ebi.ac.uk/{clean_path}",
+    ]
+
+
+def resolve_mirrors(accession: str):
+    fields = [
+        "study_accession",
+        "sample_accession",
+        "experiment_accession",
+        "run_accession",
+        "tax_id",
+        "scientific_name",
+        "fastq_ftp",
+        "fastq_md5",
+        "fastq_bytes",
+    ]
+    url = (
+        f"https://www.ebi.ac.uk/ena/portal/api/filereport"
+        f"?accession={accession}&result=read_run&fields={','.join(fields)}&format=json&download=false"
+    )
+
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+
+    records = []
+    for item in data:
+        fastq_ftps = item.get("fastq_ftp", "").split(";") if item.get("fastq_ftp") else []
+        fastq_md5s = item.get("fastq_md5", "").split(";") if item.get("fastq_md5") else []
+        fastq_sizes = item.get("fastq_bytes", "").split(";") if item.get("fastq_bytes") else []
+
+        for idx, ftp_link in enumerate(fastq_ftps):
+            if not ftp_link:
+                continue
+            filename = ftp_link.split("/")[-1]
+            mirrors = generate_mirror_urls(ftp_link)
+
+            record = {
+                "name": filename,
+                "filename": filename,
+                "mirrors": mirrors,
+                "stream_url": mirrors[0],
+                "size": int(fastq_sizes[idx]) if idx < len(fastq_sizes) and fastq_sizes[idx] else None,
+                "expected_md5": fastq_md5s[idx] if idx < len(fastq_md5s) else None,
+                "study_accession": item.get("study_accession"),
+                "sample_accession": item.get("sample_accession"),
+                "experiment_accession": item.get("experiment_accession"),
+                "run_accession": item.get("run_accession"),
+                "scientific_name": item.get("scientific_name"),
+                "tax_id": str(item.get("tax_id", "")),
+            }
+            records.append(record)
+
+    return records
+
+def resolve_optimal_mirror(url: str):
     """
-    match = re.search(r"\b([SED]RR\d{6,9})\b", text.strip())
-    return match.group(1) if match else None
-
-
-def resolve_optimal_mirror(url_or_query: str, timeout: float = 5.0) -> Tuple[str, str]:
-    """Inspects target download URL or accession identifier and resolves to
-
-    high-throughput cloud mirrors (AWS Open Data / S3) when available,
-    falling back to origin if unreachable.
+    Verilen URL için en hızlı erişilebilir mirror'ı döner.
+    ENA/SRA FTP linkleri için AWS S3 → EBI HTTPS sıralamasını dener.
+    Normal HTTP/HTTPS URL'leri için doğrudan döner.
 
     Returns:
-        Tuple[str, str]: (resolved_url, provider_name)
+        (resolved_url: str, provider: str)
     """
-    clean_target = url_or_query.strip()
-    accession = extract_run_accession(clean_target)
+    import urllib.parse
 
-    # 1. ENA Browser View URL or raw Run Accession -> AWS Open Data S3 Mirror
-    if accession and ("ena/browser/view" in clean_target or not clean_target.startswith("http")):
-        aws_candidate = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{accession}/{accession}"
-        try:
-            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                resp = client.head(aws_candidate)
-                if resp.status_code == 200:
-                    return aws_candidate, f"AWS Open Data S3 Mirror ({accession})"
-        except Exception:
-            pass  # Fall back if mirror check fails
+    parsed = urllib.parse.urlparse(url)
 
-    # 2. Direct ENA FTP/HTTP FASTQ URL -> AWS S3 / Mirror mapping
-    if "ftp.sra.ebi.ac.uk" in clean_target:
-        aws_candidate = clean_target.replace(
-            "https://ftp.sra.ebi.ac.uk", "https://sra-pub-run-odp.s3.amazonaws.com"
-        ).replace(
-            "http://ftp.sra.ebi.ac.uk", "https://sra-pub-run-odp.s3.amazonaws.com"
-        )
-        try:
-            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                resp = client.head(aws_candidate)
-                if resp.status_code == 200:
-                    return aws_candidate, "AWS Open Data (S3 Mirror)"
-        except Exception:
-            pass
+    # FTP veya EBI/SRA linkleri için mirror çözümle
+    if parsed.scheme == "ftp" or "ebi.ac.uk" in parsed.netloc or "sra.ebi" in parsed.netloc:
+        mirrors = generate_mirror_urls(url)
+        for mirror in mirrors:
+            try:
+                resp = requests.head(mirror, timeout=5, allow_redirects=True)
+                if resp.status_code < 400:
+                    if "amazonaws.com" in mirror:
+                        return mirror, "AWS Open Data"
+                    elif "ebi.ac.uk" in mirror:
+                        return mirror, "EBI HTTPS"
+                    else:
+                        return mirror, "FTP"
+            except Exception:
+                continue
 
-        return clean_target, "ENA Primary Origin (EBI)"
-
-    return clean_target, "Direct Origin"
+    # Düz HTTP/HTTPS URL — direkt döndür
+    return url, "Direct Origin"

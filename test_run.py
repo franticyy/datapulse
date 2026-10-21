@@ -1,27 +1,35 @@
-from datapulse.validator.schema import DataRecord
-from datapulse.reporter.exporter import export_to_excel, generate_pipeline_summary
-from datapulse.reporter.notifier import send_webhook_notification
+import os
+from src.nextcloud_client import NextcloudSync
+from src.datapulse.validator.checksum import calculate_hash, verify_checksum
 
-# Örnek doğrulanmış kayıtlar
-sample_records = [
-    DataRecord(id=1, title="Mekanik Klavye", category="Donanım", price=1250.0),
-    DataRecord(id=2, title="Oyuncu Faresi", category="Donanım", price=650.0),
-    DataRecord(id=3, title="Tip-C Kablo", category="Aksesuar", price=120.0),
-]
+NEXTCLOUD_URL = "https://ivo.lv.tab.digital"
+USERNAME = "gulberkayy14@gmail.com"
+APP_PASSWORD = "PSsJk-Pe57n-DDEdB-ZZzRJ-KsrA2"
 
-# 1. Excel raporunu oluştur
-report_path = export_to_excel(sample_records)
-print(f"Excel Raporu Oluşturuldu: {report_path}")
-
-# 2. Özet metrik çıkar
-summary = generate_pipeline_summary(
-    total_downloaded_bytes=2048,
-    valid_count=len(sample_records),
-    invalid_count=0,
-    checksum_passed=True,
+client = NextcloudSync(
+    base_url=NEXTCLOUD_URL,
+    username=USERNAME,
+    app_password=APP_PASSWORD,
+    chunk_size_mb=5
 )
-print(f"Pipeline Özeti: {summary}")
 
-# 3. Webhook simülasyonu (URL olmadığı için güvenli şekilde atlar)
-sent = send_webhook_notification(webhook_url=None, summary=summary)
-print(f"Webhook Bildirimi Gönderildi mi: {sent} (URL tanımlanmadığı için pas geçildi)")
+dummy_file = "test_large_run.fastq"
+if not os.path.exists(dummy_file):
+    with open(dummy_file, "wb") as f:
+        f.seek(12 * 1024 * 1024 - 1)
+        f.write(b"\0")
+
+print("Test yüklemesi başlıyor...")
+client.upload_file_chunked(dummy_file, remote_folder="DataPulse_Bench")
+
+# Mevcut validator modülüyle doğrulama
+local_md5 = calculate_hash(dummy_file, algorithm="md5")
+print(f"\nYerel MD5 : {local_md5}")
+
+remote_path = f"DataPulse_Bench/{dummy_file}"
+remote_hash = client.get_remote_checksum(remote_path)
+print(f"Nextcloud Hash : {remote_hash if remote_hash else 'Sunucu anlık header dönmedi'}")
+
+if remote_hash:
+    is_valid = verify_checksum(dummy_file, remote_hash.split(":")[-1], algorithm="md5")
+    print(f"Bütünlük Durumu: {'BAŞARILI' if is_valid else 'BOZUK VERİ'}")

@@ -1,26 +1,45 @@
 from pathlib import Path
-from typing import List
+from typing import List, Union
 import pandas as pd
-from datapulse.validator.schema import DataRecord
 
 
 def export_to_excel(
-    records: List[DataRecord],
-    output_dir: Path | str = "reports",
+    records: List[Union[dict, object]],
+    output_dir: Union[Path, str] = "reports",
     filename: str = "summary_report.xlsx",
 ) -> Path:
-    """Doğrulanmış kayıtları formatlı bir Excel tablosuna aktarır."""
+    """
+    Doğrulanmış kayıtları formatlı bir Excel tablosuna aktarır.
+    Pydantic model, ReportRecord (dict alt sınıfı) veya düz dict kabul eder.
+    """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     target_file = out_path / filename
 
-    # Pydantic modellerini sözlük listesine çevir
-    data = [record.model_dump() for record in records]
+    data = []
+    for record in records:
+        if hasattr(record, "model_dump"):
+            data.append(record.model_dump())
+        elif isinstance(record, dict):
+            data.append(dict(record))
+        else:
+            data.append(vars(record))
+
     df = pd.DataFrame(data)
 
-    # Excel dosyasına yaz (openpyxl motoruyla)
+    # Raporlarda gösterilecek sütun sırası
+    preferred_columns = [
+        "filename", "size_bytes", "calculated_md5", "calculated_sha256",
+        "verified", "status", "archive_status", "mirror_provider",
+        "run_accession", "sample_accession", "study_accession", "scientific_name",
+        "path", "error",
+    ]
+    cols = [c for c in preferred_columns if c in df.columns]
+    extra = [c for c in df.columns if c not in cols]
+    df = df[cols + extra]
+
     with pd.ExcelWriter(target_file, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Valid Records")
+        df.to_excel(writer, index=False, sheet_name="Verified Records")
 
     return target_file
 

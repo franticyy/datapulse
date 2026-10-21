@@ -1,62 +1,74 @@
 import gzip
-import tarfile
-import zipfile
+import zlib
 from pathlib import Path
 from typing import Tuple
 
 
-def verify_archive_integrity(file_path: Path | str) -> Tuple[bool, str]:
-    """Zero-RAM verification for compressed archives (gzip, zip, tar).
+_BGZF_EOF = bytes([
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+])
 
-    Pipes the byte stream through standard library decoders to validate
-    CRC32 checksums, EOF markers, and central directories without disk extraction.
-    """
-    path = Path(file_path)
-    if not path.is_file():
-        return False, f"File not found: {path}"
 
-    filename = path.name.lower()
+def check_bgzf_eof(filepath: str) -> bool:
+    path = Path(filepath)
+    if not path.is_file() or path.stat().st_size < 28:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(-28, 2)
+            tail = f.read(28)
+        return tail == _BGZF_EOF
+    except OSError:
+        return False
 
-    # Gzip / FASTQ.gz verification
-    if filename.endswith(".gz"):
-        try:
-            with gzip.open(path, "rb") as gz_file:
-                # Read in 1 MB chunks to calculate CRC32 & verify trailing ISIZE
-                while chunk := gz_file.read(1024 * 1024):
-                    pass
-            return True, "Gzip stream integrity verified (CRC32/ISIZE match)."
-        except gzip.BadGzipFile:
-            return False, "Corrupted archive: Invalid gzip header or bad checksum."
-        except EOFError:
-            return False, "Corrupted archive: Truncated stream or missing EOF marker."
-        except Exception as err:
-            return False, f"Gzip stream verification failed: {err}"
 
-    # ZIP verification
-    elif filename.endswith(".zip"):
-        try:
-            with zipfile.ZipFile(path, "r") as zip_ref:
-                corrupted_member = zip_ref.testzip()
-                if corrupted_member:
-                    return False, f"Corrupted file inside archive: {corrupted_member}"
-            return True, "ZIP central directory and member CRC32 verified."
-        except zipfile.BadZipFile:
-            return False, "Corrupted archive: Invalid ZIP format."
-        except Exception as err:
-            return False, f"ZIP verification failed: {err}"
+verify_bgzf_eof = check_bgzf_eof
+check_eof = check_bgzf_eof
 
-    # TAR / TAR.GZ verification
-    elif filename.endswith(".tar") or filename.endswith(".tar.gz") or filename.endswith(".tgz"):
-        mode = "r:gz" if (filename.endswith(".tar.gz") or filename.endswith(".tgz")) else "r:"
-        try:
-            with tarfile.open(path, mode) as tar_ref:
-                # Iterate through tar header blocks without unpacking payloads
-                for _ in tar_ref:
-                    pass
-            return True, "TAR header blocks and metadata structures verified."
-        except (tarfile.TarError, EOFError) as err:
-            return False, f"Corrupted archive: TAR header validation failed ({err})."
-        except Exception as err:
-            return False, f"TAR verification failed: {err}"
 
-    return True, "Uncompressed or non-standard archive (skipped stream validation)."
+def _check_gzip(path: Path) -> Tuple[bool, str]:
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(1024 * 1024):
+                pass
+        return True, "Gzip stream integrity verified."
+    except gzip.BadGzipFile:
+        return False, "Corrupted (Bad Gzip Header)"
+    except EOFError:
+        return False, "Corrupted (Truncated Gzip)"
+    except zlib.error as e:
+        return False, f"Corrupted (CRC Error: {e})"
+    except OSError as e:
+        return False, f"Error ({e})"
+
+
+def _check_bam(path: Path) -> Tuple[bool, str]:
+    if check_bgzf_eof(str(path)):
+        return True, "BGZF integrity verified."
+    return False, "Corrupted (No BGZF EOF)"
+
+
+def verify_archive_integrity(filepath) -> Tuple[bool, str]:
+    path = Path(filepath)
+
+    if not path.exists():
+        return False, "Error (File Not Found)"
+    if path.stat().st_size == 0:
+        return False, "Error (Empty File)"
+
+    name_lower = path.name.lower()
+
+    if name_lower.endswith(".bam"):
+        return _check_bam(path)
+    if name_lower.endswith(".bgz"):
+        ok = check_bgzf_eof(str(path))
+        return (True, "BGZF integrity verified.") if ok else (False, "Corrupted (No BGZF EOF)")
+    if name_lower.endswith(".gz") or name_lower.endswith(".fastq.gz"):
+        if check_bgzf_eof(str(path)):
+            return True, "BGZF integrity verified."
+        return _check_gzip(path)
+
+    return True, "Non-archive file verified."

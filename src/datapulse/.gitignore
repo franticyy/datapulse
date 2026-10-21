@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Sanal ortam
+.venv/
+venv/
+env/
+
+# Proje çıktıları
+downloads/
+reports/
+logs/
+*.log
+
+# Test önbelleği
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hassas dosyalar
+*.pem
+*.key
+credentials.json
+token.json
+service_account.json

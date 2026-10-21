@@ -1,30 +1,40 @@
-from typing import Any, Dict, List, Optional, Tuple
-from pydantic import BaseModel, Field, ValidationError
+from typing import Optional
+from pydantic import BaseModel, Field
 
 
 class DataRecord(BaseModel):
-    """Gelen verinin doğrulanacağı örnek şema modeli."""
-
-    id: int = Field(..., description="Tekil kayıt kimliği")
-    title: str = Field(..., min_length=2, description="Başlık veya ürün adı")
-    category: str = Field(default="Genel")
-    price: Optional[float] = Field(default=0.0, ge=0.0, description="Fiyat (negatif olamaz)")
-    status: str = Field(default="active")
-
-
-def validate_records(raw_data: List[Dict[str, Any]]) -> Tuple[List[DataRecord], List[Dict[str, Any]]]:
     """
-    Gelen ham kayıtları doğrular.
-    Geçerli kayıtları ve hatalı kayıtları (hata detayıyla birlikte) iki ayrı liste olarak döner.
+    İndirilen ve doğrulanan bir veri dosyasını temsil eder.
+    exporter.py tarafından Excel raporuna dönüştürülür.
     """
-    valid_records: List[DataRecord] = []
-    invalid_records: List[Dict[str, Any]] = []
 
-    for item in raw_data:
-        try:
-            record = DataRecord(**item)
-            valid_records.append(record)
-        except ValidationError as e:
-            invalid_records.append({"raw_item": item, "errors": e.errors()})
+    # Dosya kimliği
+    filename: str = Field(..., description="Dosya adı")
+    path: Optional[str] = Field(None, description="Yerel disk yolu")
 
-    return valid_records, invalid_records
+    # Boyut
+    size_bytes: int = Field(0, description="Dosya boyutu (bayt)")
+
+    # Checksum
+    calculated_md5: Optional[str] = Field(None, description="Hesaplanan MD5")
+    calculated_sha256: Optional[str] = Field(None, description="Hesaplanan SHA-256")
+
+    # Doğrulama sonucu
+    verified: bool = Field(False, description="Hash ve arşiv bütünlüğü geçti mi?")
+    archive_status: Optional[str] = Field(None, description="Arşiv bütünlük mesajı")
+    status: Optional[str] = Field(None, description="VERIFIED / FAILED / ERROR")
+
+    # Kaynak bilgisi
+    source_url: Optional[str] = Field(None, description="İndirme URL'si")
+    mirror_provider: Optional[str] = Field(None, description="Kullanılan mirror (AWS, EBI...)")
+
+    # ENA metadata
+    run_accession: Optional[str] = None
+    sample_accession: Optional[str] = None
+    study_accession: Optional[str] = None
+    scientific_name: Optional[str] = None
+
+    # Hata
+    error: Optional[str] = Field(None, description="Varsa hata mesajı")
+
+    model_config = {"extra": "allow"}  # cli.py'den gelen ek alanları kabul et

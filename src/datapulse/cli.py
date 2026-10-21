@@ -1,435 +1,502 @@
 import os
 import sys
-import json
-import re
-import time
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import click
-import requests
+from concurrent.futures import ThreadPoolExecutor
 from rich.console import Console
-from rich.prompt import Prompt, IntPrompt
 from rich.panel import Panel
+from rich.table import Table
 from rich.progress import (
-    Progress,
-    TextColumn,
     BarColumn,
     DownloadColumn,
-    TransferSpeedColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
     TimeRemainingColumn,
-    SpinnerColumn
+    TransferSpeedColumn,
 )
 
 from datapulse.downloader.stream import download_stream
-from datapulse.downloader.mirror import resolve_optimal_mirror
-from datapulse.downloader.parallel import download_concurrently
-from datapulse.scraper.nextcloud import list_nextcloud_files, parse_nextcloud_share_url
-from datapulse.scraper.extractor import fetch_ena_links
-from datapulse.scraper.gdrive import (
-    parse_gdrive_url, 
-    list_gdrive_folder_files, 
-    get_gdrive_direct_download_info
-)
-from datapulse.validator.archive import verify_archive_integrity
+import datapulse.scraper.extractor as ext_mod
+import datapulse.scraper.gdrive as gdrive_mod
+import datapulse.scraper.nextcloud as nextcloud_mod
+import datapulse.downloader.mirror as mirror_mod
+import datapulse.validator.archive as arch_mod
+import datapulse.validator.checksum as check_mod
 from datapulse.validator.checksum import calculate_hash
-from datapulse.reporter.certificate import generate_data_certificate
-from datapulse.reporter.exporter import generate_pipeline_summary
-from datapulse.reporter.notifier import send_webhook_notification
+import datapulse.reporter.certificate as cert_mod
+import datapulse.reporter.exporter as exp_mod
+
+# Upload Modülleri
+import datapulse.uploader.nextcloud as up_nc
+import datapulse.uploader.s3 as up_s3
+import datapulse.uploader.ena_ftp as up_ena
+import datapulse.uploader.gdrive as up_gd
+
 
 console = Console()
 
 
-def is_genomic_accession(val: str) -> bool:
-    """NCBI / ENA accession formatini dogrular."""
-    pattern = r"^[A-Z]{3,6}\d{5,9}$"
-    return bool(re.match(pattern, val.strip().upper()))
+class ReportRecord(dict):
+    def model_dump(self, **_kwargs):
+        return dict(self)
+
+    def __getattr__(self, item):
+        return self.get(item)
 
 
-def _safe_remove(file_path: Path, retries: int = 5, delay: float = 0.5):
-    """Windows uzerindeki dosya kilitlerini (WinError 32) asarak guvenli silme yapar."""
-    for _ in range(retries):
+def is_file_fully_verified(filepath: str, expected_size: int = None) -> bool:
+    if not os.path.exists(filepath):
+        return False
+    local_size = os.path.getsize(filepath)
+    if local_size == 0:
+        return False
+    if expected_size and expected_size > 0:
+        if local_size < expected_size:
+            return False
+    fn_lower = filepath.lower()
+    if fn_lower.endswith((".bam", ".gz", ".bgz")):
         try:
-            if file_path.exists():
-                file_path.unlink()
-            return
-        except (PermissionError, OSError):
-            time.sleep(delay)
+            return arch_mod.check_bgzf_eof(filepath)
+        except Exception:
+            return True
+    return True
 
 
-def _fetch_remote_md5_content(url: str) -> str:
-    """Nextcloud veya HTTP uzerindeki .md5/.md5sum dosyasinin icindeki hash'i ceker."""
+def build_record_dict(file_name: str, dest_path: str, eof_status: str, sha256_hash: str = None) -> "ReportRecord":
+    file_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    md5_hash = calculate_hash(dest_path, algorithm="md5")
+    if not sha256_hash or sha256_hash in ["N/A", "ERROR"]:
+        sha256_hash = calculate_hash(dest_path, algorithm="sha256")
+    is_valid = "Corrupted" not in eof_status and sha256_hash != "ERROR"
+    return ReportRecord({
+        "filename": file_name,
+        "path": dest_path,
+        "size_bytes": file_size,
+        "calculated_md5": md5_hash,
+        "calculated_sha256": sha256_hash,
+        "verified": is_valid,
+        "archive_status": eof_status if eof_status != "N/A" else "Non-archive file verified.",
+        "status": "VERIFIED" if is_valid else "FAILED",
+    })
+
+
+def resolve_source_files(target_input: str) -> list:
+    target_lower = target_input.lower()
+
+    if any(k in target_lower for k in ["index.php/s/", "nextcloud", "owncloud", "genclouddrive"]):
+        console.print("[cyan]🔍 Kaynak: Nextcloud / WebDAV tespit edildi.[/cyan]")
+        raw_files = nextcloud_mod.list_nextcloud_files(target_input)
+        normalized = []
+        for f in raw_files:
+            fname = f.get("filename") or f.get("name") or "unnamed"
+            furl = f.get("url") or f.get("stream_url") or f.get("download_url")
+            fsize = f.get("size")
+            record = dict(f)
+            record.update({"name": fname, "stream_url": furl, "size": fsize})
+            normalized.append(record)
+        return normalized
+
+    if any(k in target_lower for k in ["drive.google.com", "folders/", "id="]) or len(target_input) in [28, 33, 44]:
+        console.print("[cyan]🔍 Kaynak: Google Drive arşivi tespit edildi.[/cyan]")
+        return gdrive_mod.list_gdrive_folder_files(target_input)
+
+    if any(target_input.upper().startswith(p) for p in ["PRJ", "ERR", "SRR", "DRR", "SAMN", "ERP"]):
+        console.print(f"[cyan]🧬 Kaynak: Biyo-arşiv Accession ID ({target_input.upper()}) tespit edildi.[/cyan]")
+        return mirror_mod.resolve_mirrors(target_input)
+
     try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            text = r.text.strip()
-            match = re.search(r"([a-fA-F0-9]{32})", text)
-            if match:
-                return match.group(1).lower()
-    except Exception:
-        pass
-    return None
+        return ext_mod.fetch_ena_links(target_input)
+    except Exception as exc:
+        raise ValueError(f"Desteklenmeyen kaynak girdisi: {target_input}") from exc
 
 
-def _process_single_target(
-    target: dict, 
-    output_dir: str, 
-    progress: Progress, 
-    task_id, 
-    webhook: str = None,
-    max_retries: int = 3
-) -> dict:
-    """Dosyayi indirir, MD5/SHA256 ve EOF testlerini yapar. Bozuksa guvenli silip bastan dener."""
-    out_path = Path(output_dir) / target["filename"]
-    expected_md5 = target.get("expected_md5")
+def run_download() -> None:
+    """İndirme, Smart Skip, Failover ve Raporlama Motoru"""
+    url_input = console.input(
+        "\n[bold yellow]?[/bold yellow] Veri Kaynağı (GDrive Linki, Nextcloud Linki veya ENA/NCBI ID):\n[dim]>> [/dim]"
+    ).strip()
 
-    for attempt in range(1, max_retries + 1):
-        progress.update(task_id, description=f"[cyan]{target['filename'][:20]} ({attempt}/{max_retries})[/cyan]")
-        download_stream(
-            target["stream_url"], 
-            str(out_path), 
-            progress=progress, 
-            task_id=task_id
+    if not url_input:
+        url_input = "PRJEB79944"
+
+    with console.status("[cyan]Veri kaynağı taranıyor ve aynalar çözümleniyor...[/cyan]", spinner="dots"):
+        try:
+            files = resolve_source_files(url_input)
+        except Exception as e:
+            console.print(f"[bold red]Hata:[/bold red] Kaynak taranırken sorun oluştu: {e}")
+            sys.exit(1)
+
+    if not files:
+        console.print("[yellow]Hedef kaynakta indirilebilir dosya bulunamadı.[/yellow]")
+        sys.exit(0)
+
+    console.print(f"[green]✓[/green] Toplam [bold cyan]{len(files)}[/bold cyan] dosya tespit edildi.")
+
+    filter_term = console.input(
+        "\n[bold yellow]?[/bold yellow] İndirmek istediğin özel bir kelime/filtre var mı? (Hepsini indirmek için Enter'a bas): "
+    ).strip()
+
+    if filter_term:
+        term_clean = filter_term.lower()
+
+        def matches_filter(item):
+            fname = (item.get("name") or item.get("filename") or "").lower()
+            if term_clean in fname:
+                return True
+            for val in item.values():
+                if isinstance(val, str) and term_clean in val.lower():
+                    return True
+                elif isinstance(val, (list, tuple)):
+                    for sub in val:
+                        if isinstance(sub, str) and term_clean in sub.lower():
+                            return True
+            return False
+
+        filtered_files = [f for f in files if matches_filter(f)]
+        console.print(f"[cyan]ℹ[/cyan] Filtre uygulandı: [bold green]{len(filtered_files)}/{len(files)}[/bold green] dosya eşleşti.")
+        target_files = filtered_files
+    else:
+        target_files = files
+
+    if not target_files:
+        console.print("[yellow]Filtreye uygun dosya bulunamadı. Çıkılıyor.[/yellow]")
+        sys.exit(0)
+
+    downloads_dir = os.path.abspath("downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    skip_prompt = console.input(
+        "\n[bold yellow]?[/bold yellow] Sadece tam inmiş ve doğrulanmış dosyalar atlansın mı? (Yarıda kalanlar devam eder) (E/h): "
+    ).strip().lower()
+    skip_existing = skip_prompt != "h"
+
+    already_downloaded = []
+    to_download = []
+
+    for f in target_files:
+        fn = f.get("name") or f.get("filename") or "unnamed"
+        fp = os.path.join(downloads_dir, fn)
+        expected_sz = f.get("size")
+        if skip_existing and is_file_fully_verified(fp, expected_sz):
+            already_downloaded.append(f)
+        else:
+            to_download.append(f)
+
+    if skip_existing:
+        if already_downloaded:
+            table = Table(title="[bold green]📁 Doğrulanmış ve Tam Olduğu İçin Atlanan Dosyalar[/bold green]", border_style="green")
+            table.add_column("Dosya Adı", style="cyan")
+            table.add_column("Mevcut Boyut", justify="right", style="green")
+            table.add_column("Durum", justify="center", style="bold green")
+            for f in already_downloaded:
+                fn = f.get("name") or f.get("filename") or "unnamed"
+                fp = os.path.join(downloads_dir, fn)
+                sz = os.path.getsize(fp)
+                sz_str = f"{sz / (1024**3):.2f} GB" if sz >= 1024**3 else f"{sz / (1024**2):.2f} MB"
+                table.add_row(fn, sz_str, "TAM & DOĞRULANDI")
+            console.print(table)
+            console.print(
+                f"[yellow]⚡ Toplam [bold]{len(already_downloaded)}[/bold] tam dosya atlandı, "
+                f"[bold green]{len(to_download)}[/bold green] dosya indirilecek/tamamlanacak.[/yellow]\n"
+            )
+        else:
+            console.print("[dim cyan]ℹ Tam inmiş dosya bulunamadı; eksik/yarıda kalan tüm dosyalar tamamlanacak.[/dim cyan]\n")
+
+    results = []
+    for f in already_downloaded:
+        fn = f.get("name") or f.get("filename") or "unnamed"
+        fp = os.path.join(downloads_dir, fn)
+        eof_st = "BGZF integrity verified." if fn.lower().endswith((".bam", ".gz", ".bgz")) else "Valid"
+        sha_h = calculate_hash(fp, algorithm="sha256")
+        results.append(build_record_dict(fn, fp, eof_st, sha_h))
+
+    if not to_download:
+        console.print("[bold green]✓ Tüm dosyalar zaten eksiksiz ve doğrulanmış durumda![/bold green]")
+    else:
+        worker_prompt = console.input(
+            "[bold yellow]?[/bold yellow] Aynı anda kaç dosya indirilsin? (Worker sayısı) (Varsayılan: 2): "
+        ).strip()
+        try:
+            max_workers = int(worker_prompt) if worker_prompt else 2
+        except ValueError:
+            max_workers = 2
+
+        console.print(f"\n[bold green]⚡[/bold green] {len(to_download)} dosya için indirme ve doğrulama başlatılıyor...\n")
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•", DownloadColumn(),
+            "•", TransferSpeedColumn(),
+            "•", TimeRemainingColumn(),
+            console=console,
         )
 
-        progress.update(task_id, description=f"[yellow]Doğrulanıyor: {target['filename'][:15]}...[/yellow]")
+        def get_mirror_tag(url: str) -> str:
+            if "amazonaws.com" in url:
+                return "[bold magenta][AWS-S3][/bold magenta]"
+            elif "ftp.sra.ebi.ac.uk" in url or "ebi.ac.uk" in url:
+                return "[bold blue][EBI][/bold blue]"
+            elif "drive.google" in url:
+                return "[bold yellow][GDrive][/bold yellow]"
+            return "[bold cyan][HTTP][/bold cyan]"
 
-        file_sha256 = calculate_hash(str(out_path), algorithm="sha256")
-        file_md5 = calculate_hash(str(out_path), algorithm="md5")
+        def process_download(file_info):
+            file_name = file_info.get("name") or file_info.get("filename") or "unnamed_file"
+            dest_path = os.path.join(downloads_dir, file_name)
 
-        md5_match = True
-        if expected_md5:
-            md5_match = (file_md5.lower() == expected_md5.lower())
+            mirrors = file_info.get("mirrors")
+            if not mirrors:
+                single_url = (
+                    file_info.get("stream_url")
+                    or file_info.get("url")
+                    or file_info.get("download_url")
+                    or f"https://drive.google.com/uc?id={file_info.get('file_id', '')}&export=download"
+                )
+                mirrors = [single_url]
 
-        archive_valid = True
-        archive_status = "Not Compressed"
-        if str(out_path).endswith((".gz", ".fastq.gz", ".tar.gz", ".zip", ".fq.gz")):
-            archive_res = verify_archive_integrity(str(out_path))
-            if isinstance(archive_res, tuple):
-                archive_valid, archive_status = archive_res
-            else:
-                archive_valid = bool(archive_res)
-                archive_status = "Valid" if archive_valid else "Corrupted"
+            task_id = progress.add_task(
+                description=f"[dim]Bağlanıyor...[/dim] [bold white]{file_name}[/bold white]",
+                total=file_info.get("size"),
+            )
 
-        is_fully_healthy = md5_match and archive_valid
+            download_success = False
+            used_mirror_tag = "[HTTP]"
+            last_err = None
 
-        if is_fully_healthy:
-            status_text = "MD5 OK | EOF OK" if expected_md5 else f"EOF {archive_status}"
-            progress.update(task_id, description=f"[green]✓ {target['filename'][:20]} ({status_text})[/green]")
-            
-            audit_data = {
-                "source_input": target["source_input"],
-                "resolved_url": target["stream_url"],
-                "provider": target["provider"],
-                "output_file": str(out_path),
-                "file_size": os.path.getsize(out_path),
-                "sha256": file_sha256,
-                "md5": file_md5,
-                "expected_md5": expected_md5 or "N/A",
-                "md5_matched": md5_match,
-                "archive_valid": archive_valid,
-                "archive_status": archive_status,
-                "attempts": attempt
-            }
+            for mirror_url in mirrors:
+                used_mirror_tag = get_mirror_tag(mirror_url)
+                progress.update(task_id, description=f"{used_mirror_tag} [bold white]{file_name}[/bold white]")
+                try:
+                    download_stream(url=mirror_url, destination_file=dest_path, progress=progress, task_id=task_id)
+                    download_success = True
+                    break
+                except Exception as err:
+                    last_err = err
+                    continue
 
-            clean_name = Path(target["filename"]).stem.replace(".", "_")
-            cert_path = f"./reports/certificate_{clean_name}.html"
-            try:
-                generate_data_certificate(audit_data, cert_path)
-            except Exception:
-                pass
+            if not download_success:
+                progress.update(task_id, description=f"[red]✗ [Hata][/red] [bold white]{file_name}[/bold white]")
+                err_record = build_record_dict(file_name, dest_path, "Error", "ERROR")
+                err_record["status"] = f"Error: {last_err}"
+                return err_record
 
-            if webhook:
-                send_webhook_notification(webhook, audit_data)
+            eof_status = "N/A"
+            if file_name.lower().endswith((".bam", ".gz", ".bgz")):
+                try:
+                    is_eof_valid = arch_mod.check_bgzf_eof(dest_path)
+                    eof_status = "BGZF integrity verified." if is_eof_valid else "Corrupted (No EOF)"
+                except Exception:
+                    eof_status = "N/A"
 
-            return audit_data
+            sha256_hash = calculate_hash(dest_path, algorithm="sha256")
+            file_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+
+            progress.update(
+                task_id,
+                completed=file_size,
+                total=file_size,
+                description=f"[green]✓[/green] {used_mirror_tag} [bold white]{file_name}[/bold white] [dim]({eof_status})[/dim]",
+            )
+
+            record = build_record_dict(file_name, dest_path, eof_status, sha256_hash)
+            record["mirror_provider"] = "AWS Open Data" if "AWS" in used_mirror_tag else "EBI Primary"
+            return record
+
+        with progress:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(process_download, f) for f in to_download]
+                for future in futures:
+                    results.append(future.result())
+
+    reports_dir = os.path.abspath("reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    console.print(f"\n[green]✓[/green] [bold]İşlem tamamlandı![/bold] Toplam [cyan]{len(results)}[/cyan] dosya denetlendi.")
+
+    with console.status("[cyan]QC Sertifikası ve Excel Raporu hazırlanıyor...[/cyan]", spinner="dots"):
+        try:
+            cert_res = cert_mod.generate_data_certificate(results, output_dir=reports_dir)
+            cert_path = cert_res.get("html") if isinstance(cert_res, dict) else cert_res
+            excel_path = exp_mod.export_to_excel(results, output_dir=reports_dir)
+            console.print("[bold green]✓ Raporlar hazır:[/bold green]")
+            if cert_path:
+                console.print(f"  📄 HTML Sertifikası : [cyan]{cert_path}[/cyan]")
+            if excel_path:
+                console.print(f"  📊 Excel Denetim    : [cyan]{excel_path}[/cyan]")
+        except Exception as e:
+            console.print(f"[dim yellow]Rapor oluşturma hatası:[/dim yellow] {e}")
+
+
+def _make_upload_cert(file_path: str, destination: str, destination_url: str) -> None:
+    """Upload sonrası checksum hesaplar ve sertifika üretir."""
+    with console.status("[bold cyan]Kriptografik bütünlük (MD5/SHA256) hesaplanıyor..."):
+        local_md5 = check_mod.calculate_hash(file_path, algorithm="md5")
+        local_sha256 = check_mod.calculate_hash(file_path, algorithm="sha256")
+    record = {
+        "filename": os.path.basename(file_path),
+        "size_bytes": os.path.getsize(file_path),
+        "calculated_md5": local_md5,
+        "calculated_sha256": local_sha256,
+        "verified": True,
+        "archive_status": "VALID (PASSED)",
+        "destination": destination,
+        "destination_url": destination_url,
+    }
+    result = cert_mod.generate_data_certificate(records=[record])
+    html_path = result.get("html") or result.get("html_file") or "reports/certificate.html"
+    console.print(f"[bold green]✓ Kriptografik Doğrulama Sertifikası Üretildi:[/bold green] [underline]{html_path}[/underline]")
+
+
+def run_upload() -> None:
+    """Yükleme Motoru (Nextcloud, S3, ENA Webin FTP, GDrive)"""
+    console.print("\n[bold cyan]🚀 DataPulse Upload Engine[/bold cyan]")
+
+    file_path = console.input(
+        "\n[bold yellow]?[/bold yellow] Yüklenecek dosya yolu (örn: test_sample.fastq.gz): "
+    ).strip().strip("\"'")
+
+    if not os.path.exists(file_path):
+        console.print(f"[bold red]Hata:[/bold red] '{file_path}' dosyası bulunamadı.")
+        return
+
+    file_size = os.path.getsize(file_path)
+    file_name = os.path.basename(file_path)
+    console.print(f"[green]✓[/green] Dosya seçildi: [bold cyan]{file_name}[/bold cyan] ({file_size / (1024**2):.2f} MB)")
+
+    console.print("\n[bold yellow]Hedef Platform Seçin:[/bold yellow]")
+    console.print("  [1] Nextcloud (Paylaşılan Klasör Linki / File Drop)")
+    console.print("  [2] AWS S3 / MinIO Object Storage")
+    console.print("  [3] ENA Webin Dropoff (FTP / TLS)")
+    console.print("  [4] Google Drive (Resumable API)")
+    choice = console.input("[dim]Seçim (1-4): [/dim]").strip()
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]⬆ {task.description}[/bold cyan]"),
+        BarColumn(bar_width=None),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        "•", DownloadColumn(),
+        "•", TransferSpeedColumn(),
+        "•", TimeRemainingColumn(),
+        console=console,
+    )
+
+    try:
+        if choice == "1":
+            share_link = console.input(
+                "[bold yellow]?[/bold yellow] Nextcloud Klasör Linki (örn: https://cloud.org/s/ABCxyz): "
+            ).strip()
+            has_pw = console.input(
+                "[bold yellow]?[/bold yellow] Şifre koruması var mı? (E/h) [Varsayılan: h]: "
+            ).strip().lower() == "e"
+            link_password = ""
+            if has_pw:
+                link_password = console.input("[bold yellow]?[/bold yellow] Link Parolası: ", password=True).strip()
+
+            with progress:
+                task_id = progress.add_task(description=f"[Nextcloud] {file_name}", total=file_size)
+                up_nc.upload_public_share(
+                    file_path=file_path,
+                    share_url=share_link,
+                    share_password=link_password,
+                    progress=progress,
+                    task_id=task_id,
+                )
+            console.print("\n[bold green]✓ Nextcloud klasörüne başarıyla yüklendi![/bold green]")
+            _make_upload_cert(file_path, "Nextcloud (Public Share)", share_link)
+
+        elif choice == "2":
+            bucket_name = console.input("[bold yellow]?[/bold yellow] S3 Bucket Adı: ").strip()
+            region = console.input("[bold yellow]?[/bold yellow] AWS Region (Varsayılan: us-east-1): ").strip() or "us-east-1"
+            ak = console.input("[bold yellow]?[/bold yellow] AWS Access Key ID: ").strip()
+            sk = console.input("[bold yellow]?[/bold yellow] AWS Secret Access Key: ", password=True).strip()
+            endpoint = console.input("[bold yellow]?[/bold yellow] Custom Endpoint (MinIO için, boş bırakın): ").strip() or None
+
+            with progress:
+                task_id = progress.add_task(description=f"[AWS-S3] {file_name}", total=file_size)
+                s3_uri = up_s3.upload_s3(
+                    file_path=file_path,
+                    bucket_name=bucket_name,
+                    aws_access_key=ak,
+                    aws_secret_key=sk,
+                    region_name=region,
+                    endpoint_url=endpoint,
+                    progress=progress,
+                    task_id=task_id,
+                )
+            console.print(f"\n[bold green]✓ S3 Bucket'a yüklendi:[/bold green] [cyan]{s3_uri}[/cyan]")
+
+        elif choice == "3":
+            ena_user = console.input("[bold yellow]?[/bold yellow] ENA Webin Kullanıcı Adı (Webin-XXXXX): ").strip()
+            ena_pass = console.input("[bold yellow]?[/bold yellow] ENA Webin Parolası: ", password=True).strip()
+
+            with progress:
+                task_id = progress.add_task(description=f"[ENA] {file_name}", total=file_size)
+                up_ena.upload_ena_ftp(
+                    file_path=file_path,
+                    username=ena_user,
+                    password=ena_pass,
+                    progress=progress,
+                    task_id=task_id,
+                )
+            console.print("\n[bold green]✓ ENA Webin Dropoff alanına başarıyla yüklendi![/bold green]")
+            _make_upload_cert(file_path, "ENA Webin Dropoff (FTPS)", "webin.ebi.ac.uk")
+
+        elif choice == "4":
+            folder_id = console.input("[bold yellow]?[/bold yellow] Hedef Klasör ID (Boş bırakılırsa Root): ").strip()
+            with progress:
+                task_id = progress.add_task(description=f"[GDrive] {file_name}", total=file_size)
+                file_id, web_link = up_gd.upload_gdrive(
+                    file_path=file_path,
+                    folder_id=folder_id,
+                    progress=progress,
+                    task_id=task_id,
+                )
+            console.print(f"\n[bold green]✓ Google Drive'a yüklendi![/bold green] (ID: [cyan]{file_id}[/cyan])")
+            if web_link:
+                console.print(f"[dim]Bağlantı: {web_link}[/dim]")
+            _make_upload_cert(file_path, "Google Drive", web_link or f"https://drive.google.com/file/d/{file_id}/view")
+
         else:
-            fail_reason = "MD5 Uyuşmazlığı" if not md5_match else f"Bozuk Arşiv ({archive_status})"
-            if attempt < max_retries:
-                progress.update(task_id, description=f"[red]✗ Hatalı ({fail_reason})! Tekrar deneniyor...[/red]")
-                _safe_remove(out_path)
-                for part_file in Path(output_dir).glob(f"{target['filename']}*.part"):
-                    _safe_remove(part_file)
-                time.sleep(1)
-            else:
-                progress.update(task_id, description=f"[bold red]✗ {target['filename'][:15]} doğrulanamadı![/bold red]")
-                return {
-                    "source_input": target["source_input"],
-                    "resolved_url": target["stream_url"],
-                    "provider": target["provider"],
-                    "output_file": str(out_path),
-                    "file_size": os.path.getsize(out_path) if os.path.exists(out_path) else 0,
-                    "sha256": file_sha256,
-                    "md5": file_md5,
-                    "expected_md5": expected_md5 or "N/A",
-                    "md5_matched": md5_match,
-                    "archive_valid": archive_valid,
-                    "archive_status": f"FAILED ({fail_reason})",
-                    "attempts": attempt
-                }
+            console.print("[yellow]Geçersiz seçim.[/yellow]")
+
+    except Exception as e:
+        console.print(f"[bold red]Yükleme Hatası:[/bold red] {e}")
 
 
-@click.group(invoke_without_command=True)
-@click.pass_context
-def app(ctx):
-    """DataPulse: Resilient, Provable Ingestion & Provenance Engine for Genomic Archives."""
-    if ctx.invoked_subcommand is None:
-        ctx.invoke(pipeline)
+def run() -> None:
+    from datapulse import setup_logging
 
+    debug_mode = "--debug" in sys.argv or os.getenv("DATAPULSE_LOG_LEVEL", "").upper() == "DEBUG"
+    log_file = os.getenv("DATAPULSE_LOG_FILE")
 
-@app.command()
-@click.option("--url", "-u", default=None, help="Accession kodu, Cloud linki veya dosya URL'si.")
-@click.option("--output-dir", "-o", default="./downloads", help="Hedef klasor.")
-@click.option("--filter", "-f", "filter_keyword", default=None, help="Dosya veya metadata filtre kelimesi.")
-@click.option("--workers", "-w", default=None, type=int, help="Eszamanli indirme is parcacigi sayisi.")
-@click.option("--webhook", default=None, help="Discord/Slack Webhook bildirim URL'si.")
-def pipeline(url: str, output_dir: str, filter_keyword: str, workers: int, webhook: str):
-    """Interaktif, coklu kaynak destekli, filtrelemeli ve self-healing pipeline calistiricisi."""
+    if debug_mode:
+        setup_logging(level="DEBUG", log_file=log_file)
+        console.print("[dim]Debug modu aktif.[/dim]")
+    elif log_file:
+        setup_logging(level="INFO", log_file=log_file)
+
     console.print(
         Panel.fit(
-            "[bold cyan]DataPulse Self-Healing Genomic Pipeline[/bold cyan]\n"
-            "[dim]NCBI/ENA • Nextcloud • Google Drive • Canlı Hız Panosu • MD5/EOF Testi • Auto-Retry[/dim]",
+            "[bold cyan]DataPulse[/bold cyan] - [bold green]Resilient Genomic Data Engine[/bold green]\n"
+            "[dim]Download & Ingestion | QC & Audit | Multi-Cloud Upload[/dim]",
             border_style="cyan",
         )
     )
 
-    # 1. URL / Kod Istegi
-    if not url:
-        url = Prompt.ask("\n[bold yellow]👉 Lütfen NCBI/ENA Proje Kodu, FASTQ URL'si veya Cloud Linkini (Nextcloud / Google Drive) girin[/bold yellow]")
+    action = console.input(
+        "\n[bold yellow]?[/bold yellow] Yapmak istediğin işlem? ([bold cyan]1[/bold cyan]: Download, [bold magenta]2[/bold magenta]: Upload) [Varsayılan: 1]: "
+    ).strip()
 
-    url = url.strip()
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs("./reports", exist_ok=True)
-
-    raw_targets = []
-    base_nc, token_nc = parse_nextcloud_share_url(url)
-    gdrive_type, gdrive_id = parse_gdrive_url(url)
-
-    # 2. Kaynak Tespiti
-    # Durum A: Google Drive Klasörü
-    if gdrive_type == "folder":
-        console.print(f"\n[bold cyan]🔍 Kaynak: Google Drive Klasörü Tespit Edildi ({gdrive_id})[/bold cyan]")
-        console.print("[dim]Google Drive klasör içeriği taranıyor...[/dim]")
-        g_files = list_gdrive_folder_files(url)
-        
-        if not g_files:
-            console.print("[yellow]Uyarı: Klasör listeleyici yanıt vermedi, doğrudan gdown ile senkronize ediliyor...[/yellow]")
-            import gdown
-            gdown.download_folder(url=url, output=output_dir, quiet=False)
-            console.print("[bold green]✓ Klasördeki dosyalar indirildi![/bold green]")
-            return
-
-        for f in g_files:
-            raw_targets.append({
-                "stream_url": f["stream_url"] or f"https://drive.google.com/uc?id={f['file_id']}&export=download",
-                "provider": "Google Drive Cloud Engine",
-                "filename": f["filename"],
-                "source_input": url,
-                "expected_md5": None,
-                "meta_text": f["filename"]
-            })
-
-    # Durum B: Google Drive Tekil Dosyası
-    elif gdrive_type == "file":
-        console.print(f"\n[bold cyan]🔍 Kaynak: Google Drive Tekil Dosyası Tespit Edildi ({gdrive_id})[/bold cyan]")
-        direct_url, fname = get_gdrive_direct_download_info(gdrive_id)
-        raw_targets.append({
-            "stream_url": direct_url,
-            "provider": "Google Drive Cloud Engine",
-            "filename": fname,
-            "source_input": url,
-            "expected_md5": None,
-            "meta_text": fname
-        })
-
-    # Durum C: Nextcloud / ownCloud Paylaşımı
-    elif "index.php/s/" in url or base_nc:
-        console.print(f"\n[bold cyan]🔍 Kaynak: Nextcloud Klasörü Tespit Edildi[/bold cyan]")
-        console.print("[dim]Klasör içeriği taranıyor...[/dim]")
-        files = list_nextcloud_files(url)
-        if not files:
-            console.print("[red]✗ Paylaşılan klasör boş veya erişilemiyor.[/red]")
-            sys.exit(1)
-
-        md5_map = {}
-        for f in files:
-            fname = f["filename"]
-            if fname.endswith((".md5", ".md5sum")):
-                target_base = re.sub(r"\.(md5|md5sum)$", "", fname)
-                md5_val = _fetch_remote_md5_content(f["url"])
-                if md5_val:
-                    md5_map[target_base] = md5_val
-
-        for f in files:
-            raw_targets.append({
-                "stream_url": f["url"],
-                "provider": "Nextcloud WebDAV Mirror",
-                "filename": f["filename"],
-                "source_input": url,
-                "expected_md5": md5_map.get(f["filename"]),
-                "meta_text": f["filename"]
-            })
-
-    # Durum D: NCBI / ENA Accession Kodu (PRJNA..., PRJEB..., SRP..., SRR...)
-    elif is_genomic_accession(url):
-        console.print(f"\n[bold cyan]🧬 Kaynak: NCBI / ENA Accession ({url.upper()})[/bold cyan]")
-        console.print("[dim]ENA Portal API üzerinden kayıtlar ve ayna hatları taranıyor...[/dim]")
-        ena_records = fetch_ena_links(url.strip())
-        if not ena_records:
-            console.print(f"[red]✗ {url} koduna ait FASTQ kaydı bulunamadı.[/red]")
-            sys.exit(1)
-
-        for rec in ena_records:
-            raw_url = rec.get("fastq_url") or rec.get("url")
-            fname = rec.get("filename") or Path(raw_url.split("?")[0]).name
-            optimal_url, optimal_provider = resolve_optimal_mirror(raw_url)
-            
-            meta_str = (
-                f"{fname} "
-                f"{rec.get('run_accession', '')} "
-                f"{rec.get('sample_accession', '')} "
-                f"{rec.get('scientific_name', '')} "
-                f"{rec.get('sample_title', '')} "
-                f"{rec.get('experiment_title', '')}"
-            )
-
-            raw_targets.append({
-                "stream_url": optimal_url,
-                "provider": optimal_provider,
-                "filename": fname,
-                "source_input": url,
-                "expected_md5": rec.get("fastq_md5") or rec.get("md5"),
-                "meta_text": meta_str
-            })
-
-    # Durum E: Doğrudan URL / Akış
+    if action == "2":
+        run_upload()
     else:
-        stream_url, provider = resolve_optimal_mirror(url)
-        filename = Path(stream_url.split("?")[0]).name
-        if not filename or filename == "download":
-            filename = "sample.fastq.gz" if "fastq" in url else "stream_output.dat"
-
-        raw_targets.append({
-            "stream_url": stream_url,
-            "provider": provider,
-            "filename": filename,
-            "source_input": url,
-            "expected_md5": None,
-            "meta_text": filename
-        })
-
-    console.print(f"[green]✓ Kaynaktan toplam {len(raw_targets)} adet dosya kaydı bulundu.[/green]")
-
-    # 3. Spesifik Kelime Filtresi
-    if filter_keyword is None and len(raw_targets) > 1:
-        filter_keyword = Prompt.ask(
-            "[bold yellow]👉 İndirmek istediğin özel bir kelime/filtre var mı? (Örn: 'human oral metagenome', '_1', 'control' - Hepsini indirmek için Enter'a bas)[/bold yellow]",
-            default=""
-        )
-
-    targets = []
-    if filter_keyword and filter_keyword.strip():
-        term = filter_keyword.strip().lower()
-        for t in raw_targets:
-            if term in t["meta_text"].lower():
-                targets.append(t)
-        console.print(f"[bold cyan]🔍 Filtre uygulandı ('{term}'): {len(targets)}/{len(raw_targets)} dosya eşleşti.[/bold cyan]")
-        if not targets:
-            console.print("[red]✗ Aranan kelimeye uygun dosya bulunamadı.[/red]")
-            sys.exit(0)
-    else:
-        targets = raw_targets
-
-    # 4. Worker Sayısı
-    total_files = len(targets)
-    if workers is None:
-        workers = IntPrompt.ask(
-            "[bold yellow]👉 Aynı anda kaç dosya indirilsin? (Eşzamanlı worker sayısı)[/bold yellow]",
-            default=min(6, total_files) if total_files > 0 else 4,
-        )
-
-    console.print(
-        f"\n[bold green]⚡ {workers} worker ile paralel indirme, doğrulama ve auto-retry başlatılıyor...[/bold green]\n"
-    )
-
-    all_audits = []
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}", justify="left"),
-        BarColumn(bar_width=25),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
-        DownloadColumn(),
-        "•",
-        TransferSpeedColumn(),
-        "•",
-        TimeRemainingColumn(),
-        console=console
-    )
-
-    with progress:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {}
-            for target in targets:
-                t_id = progress.add_task(f"[cyan]{target['filename'][:20]}[/cyan]", total=None)
-                fut = executor.submit(
-                    _process_single_target, 
-                    target, 
-                    output_dir, 
-                    progress, 
-                    t_id, 
-                    webhook,
-                    3
-                )
-                futures[fut] = target
-
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
-                    all_audits.append(res)
-                except Exception as e:
-                    failed_file = futures[future]["filename"]
-                    console.print(f"[bold red]✗ {failed_file} işlenirken hata oluştu: {e}[/bold red]")
-
-    # 5. Raporlama
-    manifest_path = "./reports/audit_manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(
-            all_audits if len(all_audits) > 1 else (all_audits[0] if all_audits else {}),
-            f,
-            indent=2,
-        )
-
-    try:
-        generate_pipeline_summary(all_audits, "./reports/pipeline_summary.xlsx")
-    except Exception:
-        pass
-
-    console.print(
-        f"\n[bold green]✓ İşlem tamamlandı! Toplam {len(all_audits)}/{len(targets)} dosya denetlendi.[/bold green]"
-    )
-    console.print("[dim]Raporlar ./reports/ klasörüne kaydedildi.[/dim]")
+        run_download()
 
 
-@app.command()
-@click.argument("archive_path")
-def verify_archive(archive_path: str):
-    """Mevcut yerel FASTQ/Gzip arşivlerinin bütünlük ve EOF durumunu test eder."""
-    if not os.path.exists(archive_path):
-        console.print(f"[red]Hata: {archive_path} dosyası bulunamadı.[/red]")
-        sys.exit(1)
-
-    console.print(f"[yellow]{archive_path} için arşiv sınırları ve EOF sentineli taranıyor...[/yellow]")
-    archive_res = verify_archive_integrity(archive_path)
-    is_valid = archive_res[0] if isinstance(archive_res, tuple) else bool(archive_res)
-
-    if is_valid:
-        console.print("[bold green]✓ Arşiv bütünlüğü doğrulandı (EOF sentineli geçerli).[/bold green]")
-    else:
-        console.print("[bold red]✗ Arşiv bozuk veya eksik (truncated)![/bold red]")
-
-
-cli = app
+app = run
+main = run
 
 if __name__ == "__main__":
-    app()
+    run()

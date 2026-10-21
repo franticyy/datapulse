@@ -2,6 +2,8 @@ import os
 import re
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +11,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# Öncelik ortam değişkenlerinde; tanımlı değilse varsayılan uygulama kimlikleri kullanılır
+# .env dosyasını otomatik yükle (varsa)
+load_dotenv()
+
+# Ortam değişkenlerinden oku
 CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET", "")
 
@@ -18,26 +23,16 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
 def extract_folder_id(folder_input: str) -> str:
-    """
-    Kullanıcı ister doğrudan Klasör ID'si girsin ister tam Google Drive URL'si 
-    yapıştırsın, geçerli klasör kimliğini ayıklar.
-    """
     if not folder_input or not folder_input.strip():
         return None
-    
     val = folder_input.strip()
     match = re.search(r"folders/([a-zA-Z0-9_-]+)", val)
     if match:
         return match.group(1)
-    
     return val
 
 
 def get_gdrive_service():
-    """
-    Kullanıcının yerel oturumunu yönetir. Token yoksa tarayıcı açarak 
-    kullanıcının kendi Google hesabından onay almasını sağlar.
-    """
     creds = None
     token_path = os.path.expanduser("~/.datapulse_gdrive_token.json")
 
@@ -55,6 +50,12 @@ def get_gdrive_service():
                 creds = None
 
         if not creds or not creds.valid:
+            if not CLIENT_ID or not CLIENT_SECRET:
+                raise RuntimeError(
+                    "Google Drive credentials eksik. "
+                    "GDRIVE_CLIENT_ID ve GDRIVE_CLIENT_SECRET ortam değişkenlerini "
+                    "veya .env dosyasını tanımla."
+                )
             client_config = {
                 "installed": {
                     "client_id": CLIENT_ID,
@@ -85,16 +86,11 @@ def upload_gdrive(
     max_retries: int = 5,
     **_kwargs,
 ):
-    """
-    Büyük genomik dosyaları 5 MB chunk'lar halinde Google Drive'a yükler.
-    Ağ kesintilerinde exponential backoff ile kaldığı yerden devam eder.
-    """
     path = Path(file_path)
     if not path.is_file():
         raise FileNotFoundError(f"Dosya bulunamadı: {file_path}")
 
     clean_folder_id = extract_folder_id(folder_id)
-
     service = get_gdrive_service()
     file_name = path.name
     file_size = path.stat().st_size
